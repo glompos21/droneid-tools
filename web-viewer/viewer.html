@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>droneid viewer</title>
+<!-- Map. Without internet these fail to load and the page falls back to a plain grid plot. -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<style>
+  :root { --bg:#0f1216; --panel:#161a20; --line:#28303a; --text:#e6e9ee; --dim:#8a94a3; --sel:#1d2a3a; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; font: 14px/1.4 system-ui, sans-serif; background: var(--bg); color: var(--text);
+         display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
+  header { display: flex; align-items: center; gap: 16px; padding: 8px 14px; border-bottom: 1px solid var(--line); }
+  h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  h2 { font-size: 15px; margin: 0 0 10px; font-weight: 600; }
+  #status { color: var(--dim); flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #status.err { color: #ff6b6b; }
+  .win button { background: none; color: var(--dim); border: 1px solid var(--line); padding: 3px 10px; cursor: pointer; font: inherit; }
+  .win button + button { border-left: 0; }
+  .win button.on { color: var(--text); background: var(--sel); }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 440px; min-height: 0; }
+  #map { position: relative; min-height: 300px; background: #0b0e11; }
+  #map canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #map .note { position: absolute; left: 10px; top: 8px; color: var(--dim); font-size: 12px; }
+  aside { border-left: 1px solid var(--line); overflow: auto; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { padding: 6px 10px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--dim); font-weight: 500; font-size: 12px; position: sticky; top: 0; background: var(--panel); }
+  td.n, th.n { text-align: right; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: #1a2029; }
+  tbody tr.sel { background: var(--sel); }
+  tbody tr.stale { color: var(--dim); }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 7px; }
+  #detail { border-top: 1px solid var(--line); background: var(--panel); padding: 12px 14px; max-height: 40vh; overflow: auto; }
+  dl { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 8px 20px; margin: 0 0 10px; }
+  dt { color: var(--dim); font-size: 12px; }
+  dd { margin: 0; overflow-wrap: anywhere; }
+  summary { cursor: pointer; color: var(--dim); }
+  pre { margin: 8px 0 0; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; color: #c3cad4; }
+  .empty { color: var(--dim); padding: 14px; }
+  @media (max-width: 900px) {
+    main { grid-template-columns: 1fr; grid-template-rows: 50vh auto; }
+    aside { border-left: 0; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>droneid viewer</h1>
+  <span id="status">loading…</span>
+  <span class="win" id="win">
+    <button data-s="300">5 min</button><button data-s="3600">1 h</button><button data-s="0" class="on">all</button>
+  </span>
+</header>
+<main>
+  <div id="map"></div>
+  <aside>
+    <table>
+      <thead><tr><th>Drone</th><th class="n">RSSI</th><th class="n">Height</th><th class="n">Speed</th><th class="n">Seen</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <div id="none" class="empty" hidden>No drones in this time window.</div>
+  </aside>
+</main>
+<section id="detail"></section>
+
+<script>
+const POLL_MS = 2000, STALE_S = 30;
+const COLORS = ['#4ea1ff', '#ff8a3d', '#3ddc97', '#e85fd0', '#ffd23f', '#9d8cff', '#ff5c5c', '#2ed3d3'];
+const UA_TYPES = ['None', 'Aeroplane', 'Helicopter / multirotor', 'Gyroplane', 'Hybrid lift (VTOL)',
+  'Ornithopter', 'Glider', 'Kite', 'Free balloon', 'Captive balloon', 'Airship',
+  'Free fall / parachute', 'Rocket', 'Tethered powered aircraft', 'Ground obstacle', 'Other'];
+
+let data = null, error = null, windowS = 0, selected = null, rawOpen = false;
+const colors = {};
+const colorOf = k => colors[k] ??= COLORS[Object.keys(colors).length % COLORS.length];
+
+// Every string from the CSV came over the air (serial, Self-ID text, ...): always escape it.
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const fmt = (v, unit, dp = 1) => v == null ? null : v.toFixed(dp) + (unit ? ' ' + unit : '');
+const shortId = k => k.length > 16 ? k.slice(0, 8) + '…' + k.slice(-5) : k;
+const clock = t => new Date(t * 1000).toLocaleTimeString();
+function ago(s) {
+  s = Math.max(0, Math.round(s));
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s / 60) + 'm';
+  return Math.floor(s / 3600) + 'h' + String(Math.floor(s % 3600 / 60)).padStart(2, '0') + 'm';
+}
+function dist([la1, lo1], [la2, lo2]) {  // metres, haversine
+  const r = Math.PI / 180, a = Math.sin((la2 - la1) * r / 2) ** 2 +
+    Math.cos(la1 * r) * Math.cos(la2 * r) * Math.sin((lo2 - lo1) * r / 2) ** 2;
+  return 12742000 * Math.asin(Math.sqrt(a));
+}
+
+// ---- map: Leaflet + OpenStreetMap when online ----
+function leafletView(el) {
+  const map = L.map(el, { preferCanvas: true }).setView([0, 0], 2);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+    { maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' }).addTo(map);
+  const layer = L.layerGroup().addTo(map);
+  let fitted = false;
+  return {
+    draw(drones) {
+      layer.clearLayers();
+      const pts = [];
+      for (const d of drones) {
+        const c = colorOf(d.key), on = d.key === selected;
+        const track = d.track.map(p => [p[0], p[1]]);
+        pts.push(...track);
+        if (track.length > 1) L.polyline(track, { color: c, weight: on ? 4 : 2, opacity: on ? 1 : 0.7 }).addTo(layer);
+        if (d.pos && d.pilot) L.polyline([d.pos, d.pilot], { color: c, weight: 1, dashArray: '4 4' }).addTo(layer);
+        if (d.pilot) {
+          pts.push(d.pilot);
+          L.circleMarker(d.pilot, { radius: 5, color: c, weight: 2, fillColor: '#000', fillOpacity: 0.6 })
+            .bindTooltip('pilot of ' + esc(d.key)).on('click', () => select(d.key)).addTo(layer);
+        }
+        if (d.pos) {
+          pts.push(d.pos);
+          L.circleMarker(d.pos, { radius: on ? 8 : 6, color: '#fff', weight: 1.5, fillColor: c, fillOpacity: 1 })
+            .bindTooltip(esc(d.key)).on('click', () => select(d.key)).addTo(layer);
+        }
+      }
+      if (!fitted && pts.length) { map.fitBounds(pts, { padding: [30, 30], maxZoom: 18 }); fitted = true; }
+    },
+    focus(d) { const p = d.pos || d.pilot; if (p) map.setView(p, Math.max(map.getZoom(), 16)); },
+  };
+}
+
+// ---- map fallback: plain grid in metres when Leaflet/tiles are unavailable ----
+function gridView(el) {
+  const cv = document.createElement('canvas');
+  const note = document.createElement('div');
+  note.className = 'note';
+  el.append(cv, note);
+  return {
+    draw(drones) {
+      const w = el.clientWidth, h = el.clientHeight, dpr = devicePixelRatio || 1;
+      cv.width = w * dpr; cv.height = h * dpr;
+      const g = cv.getContext('2d');
+      g.setTransform(dpr, 0, 0, dpr, 0, 0);
+      g.clearRect(0, 0, w, h);
+      const all = drones.flatMap(d => [...d.track, d.pos, d.pilot].filter(Boolean));
+      if (!all.length) { note.textContent = 'offline map: no positions yet'; return; }
+      // Flat-earth projection around the centre: fine for a few km.
+      const lat0 = all.reduce((s, p) => s + p[0], 0) / all.length;
+      const lon0 = all.reduce((s, p) => s + p[1], 0) / all.length;
+      const kx = 111320 * Math.cos(lat0 * Math.PI / 180), ky = 110540;
+      const m = p => [(p[1] - lon0) * kx, (p[0] - lat0) * ky];
+      const xs = all.map(p => m(p)[0]), ys = all.map(p => m(p)[1]);
+      const span = Math.max(Math.max(...xs) - Math.min(...xs), Math.max(...ys) - Math.min(...ys), 50) * 1.2;
+      const s = Math.min(w, h) / span;
+      const cx = (Math.max(...xs) + Math.min(...xs)) / 2, cy = (Math.max(...ys) + Math.min(...ys)) / 2;
+      const px = p => { const [x, y] = m(p); return [w / 2 + (x - cx) * s, h / 2 - (y - cy) * s]; };
+      // grid
+      const step = [10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000].find(v => v * s > 60) || 50000;
+      g.strokeStyle = '#1f262f'; g.lineWidth = 1; g.beginPath();
+      for (let x = (w / 2 - cx * s) % (step * s); x < w; x += step * s) { g.moveTo(x, 0); g.lineTo(x, h); }
+      for (let y = (h / 2 + cy * s) % (step * s); y < h; y += step * s) { g.moveTo(0, y); g.lineTo(w, y); }
+      g.stroke();
+      note.textContent = `offline map: grid ${step >= 1000 ? step / 1000 + ' km' : step + ' m'}, north up`;
+      for (const d of drones) {
+        const c = colorOf(d.key), on = d.key === selected;
+        g.strokeStyle = c; g.lineWidth = on ? 3 : 1.5; g.globalAlpha = on ? 1 : 0.7;
+        g.beginPath(); d.track.forEach((p, i) => g[i ? 'lineTo' : 'moveTo'](...px(p))); g.stroke();
+        g.globalAlpha = 1;
+        if (d.pos && d.pilot) {
+          g.setLineDash([4, 4]); g.lineWidth = 1;
+          g.beginPath(); g.moveTo(...px(d.pos)); g.lineTo(...px(d.pilot)); g.stroke(); g.setLineDash([]);
+        }
+        if (d.pilot) {
+          g.fillStyle = '#000'; g.lineWidth = 2;
+          g.beginPath(); g.arc(...px(d.pilot), 5, 0, 7); g.fill(); g.stroke();
+        }
+        if (d.pos) {
+          const [x, y] = px(d.pos);
+          g.fillStyle = c; g.strokeStyle = '#fff'; g.lineWidth = 1.5;
+          g.beginPath(); g.arc(x, y, on ? 8 : 6, 0, 7); g.fill(); g.stroke();
+          g.fillStyle = '#e6e9ee'; g.font = '12px system-ui'; g.fillText(shortId(d.key), x + 10, y + 4);
+        }
+      }
+    },
+    focus() {},
+  };
+}
+
+const view = window.L ? leafletView(document.getElementById('map')) : gridView(document.getElementById('map'));
+
+// ---- data ----
+function visible() {
+  if (!data) return [];
+  const cut = windowS ? data.now - windowS : -Infinity;
+  return data.drones
+    .filter(d => d.last_seen >= cut)
+    .map(d => ({ ...d, track: d.track.filter(p => p[2] >= cut) }))
+    .sort((a, b) => b.last_seen - a.last_seen);
+}
+
+function render() {
+  const drones = visible();
+  const st = document.getElementById('status');
+  st.className = error ? 'err' : '';
+  st.textContent = error || (data && `${data.file} · ${data.rows} rows · ${drones.length} of ${data.drones.length} drones`) || 'loading…';
+  document.getElementById('none').hidden = !data || drones.length > 0;
+  document.getElementById('rows').innerHTML = drones.map(d => {
+    const cls = [d.key === selected && 'sel', data.now - d.last_seen > STALE_S && 'stale'].filter(Boolean).join(' ');
+    return `<tr class="${cls}" data-key="${esc(d.key)}">
+      <td title="${esc(d.key)}"><span class="dot" style="background:${colorOf(d.key)}"></span>${esc(shortId(d.key))}</td>
+      <td class="n">${d.rssi ?? '—'}</td>
+      <td class="n">${fmt(d.height ?? d.alt_geo, 'm') ?? '—'}</td>
+      <td class="n">${fmt(d.speed, 'm/s') ?? '—'}</td>
+      <td class="n">${ago(data.now - d.last_seen)}</td></tr>`;
+  }).join('');
+  view.draw(drones);
+  renderDetail(drones.find(d => d.key === selected));
+}
+
+function renderDetail(d) {
+  const el = document.getElementById('detail');
+  if (!d) { el.innerHTML = '<div class="empty">Select a drone for details.</div>'; return; }
+  const ll = p => p && p.map(v => v.toFixed(6)).join(', ');
+  const items = [
+    ['Serial / ID', d.ids.join(', ') || d.key],
+    ['MAC', d.mac],
+    ['Transport', d.transport],
+    ['Channel', d.channel && `${d.channel} (${d.freq} MHz)`],
+    ['RSSI', d.rssi != null && `${d.rssi} dBm (min ${d.rssi_min}, max ${d.rssi_max})`],
+    ['Status', d.status],
+    ['Position', ll(d.pos)],
+    ['Height', d.height != null && fmt(d.height, 'm') + (d.height_type ? ' ' + d.height_type.toLowerCase() : '')],
+    ['Altitude (geodetic)', fmt(d.alt_geo, 'm')],
+    ['Speed', fmt(d.speed, 'm/s')],
+    ['Vertical speed', fmt(d.vert_speed, 'm/s')],
+    ['Heading', d.heading != null && d.heading + '°'],
+    ['Pilot position', ll(d.pilot)],
+    ['Drone to pilot', d.pos && d.pilot && fmt(dist(d.pos, d.pilot), 'm', 0)],
+    ['Operator ID', d.operator_id],
+    ['Self-ID text', d.self_id],
+    ['Classification', d.classification],
+    ['Aircraft type', d.ua_type != null && (UA_TYPES[d.ua_type] ?? d.ua_type)],
+    ['ID type', d.id_type],
+    ['First seen', clock(d.first_seen)],
+    ['Last seen', `${clock(d.last_seen)} (${ago(data.now - d.last_seen)} ago)`],
+    ['Frames', d.frames],
+  ].filter(([, v]) => v != null && v !== false && v !== '');
+  const raw = d.recent.slice().reverse()
+    .map(m => `${new Date(m.t).toLocaleTimeString()}  ${m.type}  ${JSON.stringify(m.data)}`).join('\n');
+  el.innerHTML = `<h2><span class="dot" style="background:${colorOf(d.key)}"></span>${esc(d.key)}</h2>
+    <dl>${items.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join('')}</dl>
+    <details${rawOpen ? ' open' : ''}><summary>Last ${d.recent.length} raw messages</summary><pre>${esc(raw)}</pre></details>`;
+  el.querySelector('details').addEventListener('toggle', e => { rawOpen = e.target.open; });
+}
+
+function select(key) {
+  selected = selected === key ? null : key;
+  render();
+  const d = visible().find(x => x.key === selected);
+  if (d) view.focus(d);
+}
+
+document.getElementById('rows').addEventListener('click', e => {
+  const tr = e.target.closest('tr');
+  if (tr) select(tr.dataset.key);
+});
+document.getElementById('win').addEventListener('click', e => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  windowS = +b.dataset.s;
+  document.querySelectorAll('#win button').forEach(x => x.classList.toggle('on', x === b));
+  render();
+});
+addEventListener('resize', render);
+
+async function poll() {
+  try {
+    const r = await fetch('/api/drones', { cache: 'no-store' });
+    if (!r.ok) throw new Error(r.status);
+    data = await r.json();
+    error = null;
+  } catch (e) {
+    error = 'Cannot reach csv_viewer.py — is it still running?';
+  }
+  render();
+  setTimeout(poll, POLL_MS);
+}
+poll();
+</script>
+</body>
+</html>

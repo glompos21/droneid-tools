@@ -1,0 +1,3 @@
+[submodule "droneid-go"]
+	path = droneid-go
+	url = https://github.com/alphafox02/droneid-go.git

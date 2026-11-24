@@ -1,0 +1,11 @@
+# Capture output
+detections.csv
+*.log
+droneid-go/
+
+# libzmq version shim, built on first run by run-with-csv.sh (per machine/arch)
+zmq-version-shim/*.so
+
+# Python
+__pycache__/
+.pytest_cache/

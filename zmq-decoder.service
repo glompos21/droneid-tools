@@ -1,0 +1,38 @@
+[Unit]
+Description=DroneID ZMQ Decoder (droneid-go)
+Documentation=https://github.com/alphafox02/WarDragon
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/home/<user>/droneid-tools
+ExecStart=/home/<user>/droneid-tools/run-with-csv.sh -ble /dev/ttyUSB0 -ble-baud 2000000 -i wlan1
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+# Logging - console output (incl. the channel-hop summary lines) goes to
+# the journal. Check `journalctl --disk-usage`: if it reports files under
+# /run (not /var/log/journal), the journal itself is RAM-only (tmpfs),
+# so this produces no SD card writes beyond detections.csv.
+# View live from any machine: ssh <pi> journalctl -u zmq-decoder -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zmq-decoder
+
+# Security hardening (what we can do while still running as root)
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+# run-with-csv.sh needs to write detections.csv and (first run only)
+# compile the libzmq version shim into this directory.
+ReadWritePaths=/sys/class/net /home/<user>/droneid-tools
+
+# Environment
+Environment=HOME=/home/<user>
+
+[Install]
+WantedBy=multi-user.target
